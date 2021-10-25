@@ -1,0 +1,1379 @@
+---
+title: "Play Predictor Final Code"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Package and Data Load
+
+```{r}
+
+rm(list=ls())
+
+```
+
+```{r}
+
+source('helper_functions.r')
+source('modified_waterfall_functions.r')
+
+```
+
+```{r load packages, warning=FALSE}
+
+# update.packages("Rcpp")
+
+p <- c("pacman","ggplot2","tidyverse","xgboost","caret","OptimalCutpoints",
+       "pROC","SHAPforxgboost","devtools","parallel","ggdark","ggimage","leaps",
+       "randomForest","teamcolors","sparcl","cluster","factoextra","gganimate")
+
+load_all_packages(p)
+
+```
+```{r load data}
+
+load("cfb_pbp_2020.rda")
+load('cfb_off_dat_2020.rda')
+
+```
+
+# Data Manipulation
+
+```{r select_useful_columns}
+
+raw_data <- pbp_2020
+
+# Initial Data Reduction
+
+reduced_data = raw_data %>% 
+  select(year,week,game_play_number,half_play_number,drive_number,
+         drive_play_number,pos_team,def_pos_team,period,clock.minutes,
+         clock.seconds,play_type,play_text,down,distance,yards_to_goal,
+         yards_gained,wpa,wp_before,scoring_opp,log_ydstogo,Goal_To_Go,
+         Under_two,Under_three,score_diff,off_timeouts_rem_before,def_timeouts_rem_before,
+         rush,pass,completion,sack)
+
+```
+
+```{r drop_playoff_games}
+
+# Drop Playoff games from Dataset (incorrectly labeled as Week 1)
+
+data = reduced_data
+
+reg_season_data <- data[!((data$pos_team %in% c("Notre Dame","Alabama","Ohio State","Clemson"))
+             & (data$def_pos_team %in% c("Notre Dame","Alabama","Ohio State","Clemson"))
+             & (data$week == 1)),]
+
+```
+
+```{r drop_other_plays}
+
+# Drop plays that aren't rush or pass
+
+reg_season_data <- reg_season_data %>% 
+  filter(rush+pass>0) %>% 
+  filter(period<=4)
+
+```
+
+```{r first_calculated_columns}
+
+data <- reg_season_data
+
+# Note: Will remove season stats from first game of season, and in-game stats 
+# from first 4 pass / run plays (this will help to avoid outliers such as a 100% 
+# season completion rate)... replace these values with NA
+
+# Calculate Defensive Season Stats
+data <- data %>% 
+  ungroup() %>% 
+  group_by(def_pos_team) %>% 
+  mutate(defense_first_week = min(week)) %>% 
+  arrange(def_pos_team,week,game_play_number) %>% 
+  mutate(def_ry_pp = 
+           ifelse(defense_first_week!=week,
+                  rush*yards_gained / cumsum(rush),
+                  NA)) %>% 
+  mutate(def_py_pp = 
+           ifelse(defense_first_week!=week,
+                  cumsum(pass*yards_gained) / cumsum(pass),
+                  NA)) %>% 
+  mutate(def_pc_pct = 
+           ifelse(defense_first_week!=week,
+                  cumsum(completion) / cumsum(pass),
+                  NA)) 
+
+# Calculate Offensive Team Season Stats
+data <- data %>%  
+  ungroup() %>% 
+  group_by(pos_team) %>% 
+  mutate(offense_first_week = min(week)) %>% 
+  arrange(pos_team,week,game_play_number) %>% 
+  mutate(off_ry_pp = 
+           ifelse(offense_first_week!=week,
+                  cumsum(rush*yards_gained) / cumsum(rush),
+                  NA)) %>% 
+  mutate(off_py_pp = 
+           ifelse(offense_first_week!=week,
+                  cumsum(pass*yards_gained) / cumsum(pass),
+                  NA)) %>% 
+  mutate(off_pc_pct = 
+           ifelse(offense_first_week!=week,
+                  cumsum(completion) / cumsum(pass),
+                  NA))
+
+# Calculate Offensive Team Game Stats
+data <- data %>%  
+  ungroup() %>% 
+  group_by(pos_team,week) %>% 
+  arrange(pos_team,week,game_play_number) %>% 
+  mutate(pass_play_number = cumsum(pass)) %>% 
+  mutate(rush_play_number = cumsum(rush)) %>% 
+  mutate(ingame_off_ry_pp = 
+           ifelse(rush_play_number>6,
+                  cumsum(rush*yards_gained) / cumsum(rush),
+                  NA)) %>% 
+  mutate(ingame_off_py_pp = 
+           ifelse(pass_play_number>6,
+                  cumsum(pass*yards_gained) / cumsum(pass),
+                  NA)) %>% 
+  mutate(ingame_off_pc_pct = 
+           ifelse(pass_play_number>6,
+                  cumsum(completion) / cumsum(pass),
+                  NA)) %>% 
+  mutate(ingame_off_rwpa_pp = 
+           ifelse(rush_play_number>6,
+                  cumsum(rush*wpa) / cumsum(rush),
+                  NA)) %>% 
+  mutate(ingame_off_pwpa_pp = 
+           ifelse(pass_play_number>6,
+                  cumsum(pass*wpa) / cumsum(pass),
+                  NA))  
+
+main_data <- data
+
+
+```
+
+## Classification Dataset
+
+```{r get_classification_dataset}
+
+grouping_data <- data %>% 
+  select(-c("year","game_play_number","half_play_number","drive_number",
+            "drive_play_number","period","clock.minutes","clock.seconds",
+            "play_type","play_text","yards_to_goal","def_pos_team","wpa",
+            "wp_before","scoring_opp","log_ydstogo","Goal_To_Go","Under_two",
+            "Under_three","off_timeouts_rem_before","def_timeouts_rem_before",
+            "completion","offense_first_week","defense_first_week","sack"))
+
+classification_data <- grouping_data %>% 
+  mutate(first_d_dist = ifelse(down==1,distance,NA)) %>% 
+  mutate(second_d_dist = ifelse(down==2,distance,NA)) %>% 
+  mutate(third_d_dist = ifelse(down==3,distance,NA)) %>% 
+  mutate(third_d_success = ifelse(down==3,
+                                  ifelse(yards_gained >= distance,1,0),NA)) %>% 
+  mutate(third_d_success_r = third_d_success * rush) %>% 
+  mutate(third_d_success_p = third_d_success * pass) %>% 
+  mutate(yards_first_d = ifelse(down==1,1,NA) * yards_gained) %>% 
+  mutate(yards_second_d = ifelse(down==2,1,NA) * yards_gained) %>%
+  mutate(yards_third_d = ifelse(down==3,1,NA) * yards_gained) %>% 
+  mutate(yards_first_d_r = yards_first_d * rush) %>% 
+  mutate(yards_first_d_p = yards_first_d * pass) %>% 
+  mutate(yards_second_d_r = yards_second_d * rush) %>% 
+  mutate(yards_second_d_p = yards_second_d * pass) %>% 
+  mutate(yards_third_d_r = yards_first_d * rush) %>% 
+  mutate(yards_third_d_p = yards_first_d * pass) %>% 
+  mutate(first_down_rush = ifelse(down==1,rush,NA)) %>% 
+  mutate(second_down_rush = ifelse(down==2,rush,NA)) %>% 
+  mutate(third_down_rush = ifelse(down==3,rush,NA))
+  
+
+classification_data <- classification_data %>% 
+  group_by(pos_team) %>% 
+  summarize(games_played = length(unique(week)),
+            avg_yards_per_play = mean(yards_gained,na.rm=T),
+            avg_score_diff = mean(score_diff,na.rm=T),
+            total_rushes = sum(rush,na.rm=T),
+            total_passes = sum(pass,na.rm=T),
+            avg_def_ry_pp = mean(def_ry_pp,na.rm=T),
+            avg_def_py_pp = mean(def_py_pp,na.rm=T),
+            avg_def_pc_pct = mean(def_pc_pct,na.rm=T),
+            avg_off_ry_pp = mean(off_ry_pp,na.rm=T),
+            avg_off_py_pp = mean(off_py_pp,na.rm=T),
+            avg_off_pc_pct = mean(off_pc_pct,na.rm=T),
+            avg_first_d_dist = mean(first_d_dist,na.rm=T),
+            avg_second_d_dist = mean(second_d_dist,na.rm=T),
+            avg_third_d_dist = mean(third_d_dist,na.rm=T),
+            third_d_success_rate = mean(third_d_success,na.rm=T),
+            third_d_success_rate_r = mean(third_d_success_r,na.rm=T),
+            third_d_success_rate_p = mean(third_d_success_p,na.rm=T),
+            rush_pct_first_d = mean(first_down_rush,na.rm=T),
+            rush_pct_second_d = mean(second_down_rush,na.rm=T),
+            rush_pct_third_d = mean(third_down_rush,na.rm=T),
+            avg_yards_first_d = mean(yards_first_d,na.rm=T),
+            avg_yards_second_d = mean(yards_second_d,na.rm=T),
+            avg_yards_third_d = mean(yards_third_d,na.rm=T),
+            avg_yards_first_d_r = mean(yards_first_d_r,na.rm=T),
+            avg_yards_second_d_r = mean(yards_second_d_r,na.rm=T),
+            avg_yards_third_d_r = mean(yards_third_d_r,na.rm=T),
+            avg_yards_first_d_p = mean(yards_first_d_p,na.rm=T),
+            avg_yards_second_d_p = mean(yards_second_d_p,na.rm=T),
+            avg_yards_third_d_p = mean(yards_third_d_p,na.rm=T)
+            )
+
+classification_data <- classification_data %>% 
+  mutate(rush_pct = total_rushes / (total_passes+total_rushes)) %>%
+  mutate(rush_pg = total_rushes / games_played) %>% 
+  mutate(pass_pg = total_passes / games_played)
+
+
+classification_data[is.nan(classification_data)] <- NA
+
+classification_data <- classification_data %>% 
+  select(-c(total_rushes,total_passes,games_played))
+
+```
+
+### Scale Data
+
+```{r finalize_clustering_data}
+
+# Scale offensive data
+clustering_data_1 <- scale(classification_data[,2:ncol(classification_data)])
+# Add teams back to data frame  
+clustering_data <- cbind.data.frame(classification_data$pos_team, clustering_data_1)
+# Fix name of team column
+names(clustering_data)[1] <- "teams"
+
+clustering_data <- na.omit(clustering_data)
+
+```
+
+## XGBoost Dataset
+
+```{r calc_lagged_metrics}
+
+xg_data <- main_data %>% 
+  group_by(pos_team,week,drive_number) %>% 
+  arrange(pos_team,week,drive_number,game_play_number) %>% 
+  mutate(prior_play_rush = lag(rush)) %>% 
+  mutate(hole_play_rush = lag(rush, n = 2L)) %>% 
+  mutate(prior_yards_gained = lag(yards_gained)) %>% 
+  mutate(prior_play_wpa = lag(wpa)) %>% 
+  mutate(prior_play_sack = lag(sack)) %>% 
+  mutate(lag_def_ry_pp = lag(def_ry_pp)) %>%
+  mutate(lag_def_py_pp = lag(def_py_pp)) %>%
+  mutate(lag_def_pc_pct = lag(def_pc_pct)) %>%
+  mutate(lag_off_ry_pp = lag(off_ry_pp)) %>%
+  mutate(lag_off_py_pp = lag(off_py_pp)) %>%
+  mutate(lag_off_pc_pct = lag(off_pc_pct)) %>%
+  mutate(lag_ingame_off_ry_pp = lag(ingame_off_ry_pp)) %>%
+  mutate(lag_ingame_off_py_pp = lag(ingame_off_py_pp)) %>%
+  mutate(lag_ingame_off_pc_pct = lag(ingame_off_pc_pct)) %>% 
+  ungroup()
+
+```
+
+```{r calc_time_metrics}
+
+xg_data <- xg_data %>% 
+  mutate(period_sec_rem = clock.minutes*60 + clock.seconds) %>% 
+  mutate(game_sec_rem = period_sec_rem + (4-period)*900) %>% 
+  mutate(half = ifelse(period > 2,2,1)) %>% 
+  mutate(half_sec_rem = period_sec_rem + (half*2 - period)*900)
+
+```
+
+```{r}
+
+xg_data <- xg_data %>% 
+  select(pos_team,def_pos_team,rush,game_play_number,half_play_number,
+         drive_play_number,period,period_sec_rem,half_sec_rem,game_sec_rem,down,
+         distance,yards_to_goal,wp_before,scoring_opp,log_ydstogo,Goal_To_Go,
+         Under_two,Under_three,off_timeouts_rem_before,def_timeouts_rem_before,
+         prior_yards_gained,prior_play_rush,hole_play_rush,prior_play_wpa,
+         prior_play_sack,lag_def_ry_pp,lag_def_py_pp,lag_def_pc_pct,
+         lag_off_ry_pp,lag_off_py_pp,lag_off_pc_pct,lag_ingame_off_ry_pp,
+         lag_ingame_off_py_pp,lag_ingame_off_pc_pct
+        )
+
+# Replace all NaN with NA
+
+xg_data[is.nan(xg_data)] <- NA
+
+```
+
+# K-Means Clustering
+
+## Exploratory Data Viz
+
+```{r}
+
+plot_dat <- merge(classification_data, cfb_logos, by.x = "pos_team", by.y = "school")
+
+# Create plot
+g_1 <- ggplot(plot_dat, # Set dataset 
+              aes(x = rush_pg, y = pass_pg)) + # Set aesthetics
+  geom_point(alpha = 0.3) + # Set geom point
+  geom_image(image = plot_dat$logos, asp = 16/9) + # Add logos
+  labs(y = "Pass Per Game", # Add labels
+       x = "Rush Per Game",
+       title = "Rush v Pass Frequency per Game",
+       subtitle = "CFB - 2020 Season") +
+  dark_theme_bw() + # Set theme
+  theme( # Modify plot elements
+    axis.text = element_text(size = 10), # Change Axis text size
+    axis.title.x = element_text(size = 12), # Change x axis title size
+    axis.title.y = element_text(size = 12), # Change y axis title size 
+    plot.title = element_text(size = 16), # Change plot title size
+    plot.subtitle = element_text(size = 14), # Change plot subtitle size
+    plot.caption = element_text(size = 10), # Change plot caption size
+    panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) # Remove grid
+
+g_1
+
+```
+
+## Optimize Clusters
+
+```{r optimize}
+
+# Create function to try different cluster numbers
+kmean_withinss <- function(k) {
+  cluster <- kmeans( x = clustering_data[,2:ncol(clustering_data)],  # Set data to use
+                     centers = k,  # Set number of clusters as k, changes with input into function
+                     nstart = 25, # Set number of starts
+                     iter.max = 100) # Set max number of iterations
+  return (cluster$tot.withinss) # Return cluster error/within cluster sum of squares
+}
+
+# Set maximum cluster number
+max_k <-20
+
+# Run algorithm over a range of cluster numbers 
+wss <- sapply(2:max_k,kmean_withinss)
+
+# Create a data frame to plot the graph
+elbow <-data.frame(2:max_k, wss)
+
+# Plot the graph with ggplot
+g_e1 <- ggplot(elbow, # Set dataset
+              aes(x = X2.max_k, y = wss)) + # Set aesthetics
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  geom_point(color = "blue") + # Set geom point for scatter
+  geom_line() + # Geom line for a line between points
+  scale_x_continuous(breaks = seq(1, 20, by = 1)) + # Set breaks for x-axis
+  labs(x = "Number of Clusters", y="Within Cluster \nSum of Squares") + # Set labels
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+# Generate plot
+g_e1
+
+```
+## K-Means Model
+
+```{r run_kmeans}
+
+set.seed(12345) # Set seed for reproducibility
+fit_1 <- kmeans(x = clustering_data[,2:ncol(clustering_data)], # Set data as explanatory variables 
+                centers = 6,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+```
+
+## Extract Results
+
+
+```{r extract_clusters}
+
+# Extract clusters
+clusters_1 <- fit_1$cluster
+# Extract centers
+centers_1 <- fit_1$centers
+
+```
+
+```{r}
+
+# Check samples per cluster
+a <- summary(as.factor(clusters_1))
+
+```
+
+```{r}
+
+team_groups <- vector(mode = "list", length = 6)
+
+for(i in 1:length(a)){
+  team_groups[[i]] =classification_data$pos_team[clusters_1 == i]
+  print(paste("Cluster ",i))
+  print(team_groups[[i]])
+ 
+}
+
+```
+## Evaluate Performance
+
+```{r}
+# Create vector of clusters
+cluster <- c(1: length(team_groups))
+# Extract centers
+center_df <- data.frame(cluster, centers_1)
+
+# Reshape the data
+center_reshape <- gather(center_df, features, values, avg_yards_per_play:pass_pg)
+
+```
+
+### Heat Map
+
+```{r gg_heat}
+
+# Create plot
+g_heat_1 <- ggplot(data = center_reshape, # Set dataset
+                   aes(x = features, y = cluster, fill = values)) + # Set aesthetics
+  scale_y_continuous(breaks = seq(1, 6, by = 1)) + # Set y axis breaks
+  geom_tile() + # Geom tile for heatmap
+  coord_equal() +  # Make scale the same for both axis
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =0, # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  theme( # Modify plot elements
+    axis.text = element_text(size = 8), # Change Axis text size
+    axis.title.x = element_text(size = 10), # Change x axis title size
+    axis.title.y = element_text(size = 10), # Change y axis title size 
+    plot.title = element_text(size = 14), # Change plot title size
+    plot.subtitle = element_text(size = 12), # Change plot subtitle size
+    plot.caption = element_text(size = 8), # Change plot caption size
+    panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+
+  coord_flip() # Rotate plot to view names clearly
+
+g_heat_1
+
+
+```
+
+### Sillhouette
+
+```{r sillhouette}
+
+# Calculate distance between samples
+dis = dist(clustering_data[,2:ncol(clustering_data)])^2
+# Set plotting parameters to view plot
+op <- par(mfrow= c(1,1), oma= c(0,0, 3, 0),
+          mgp= c(1.6,.8,0), mar= .1+c(4,2,2,2))
+# Create silhouette for k=4
+sil = silhouette (fit_1$cluster , # Set clustering
+                  dis, # Set distance 
+                  full = TRUE) # Generate silhouette for all samples
+# Generate silhouette plot
+plot(sil)
+
+```
+
+
+# XGBoost Predictive Models
+
+```{r get_cores}
+
+parallel_threads = detectCores()-3
+
+```
+
+
+## Single-Team Model - Notre Dame
+
+```{r}
+
+model_data <- xg_data %>% 
+  filter(pos_team == "Notre Dame")
+
+train_data <- model_data[sample(nrow(model_data),nrow(model_data)*.6),]
+test_data <- setdiff(model_data,train_data)
+
+train_data <- train_data %>% 
+  select(-c(def_pos_team,game_play_number))
+test_data <- test_data %>% 
+  select(-c(def_pos_team,game_play_number))
+
+train_d_predictors <- train_data %>% 
+  select(-c(pos_team,rush))
+tst_d_predictors<- test_data %>% 
+  select(-c(pos_team,rush))
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_d_predictors), 
+                        label = as.numeric(train_data$rush))
+# Create test matrix
+dtest <- xgb.DMatrix(data = as.matrix(tst_d_predictors), 
+                     label = as.numeric(test_data$rush))
+
+etas <- c(.3,.2,.1,.05, .025, .001)
+
+model_res <- vector(mode = "list", length = length(etas))
+pd_res <- vector(mode = "list", length = length(etas))
+
+for (i in c(1:length(etas)))
+{
+  temp_model <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = etas[i], # Set learning rate
+              max.depth = 7, # Set max depth
+              min_child_weight = 10, # Set minimum number of samples in node to split
+              gamma = 0, # Set minimum loss reduction for split
+              subsample = 0.9 , # Set proportion of training data to use in tree
+              colsample_bytree = 0.9, # Set number of variables to use in each tree
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 0, # 1 - Prints out fit
+              nthread = parallel_threads, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+               
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to 
+  
+  model_res[[i]] = temp_model
+  
+  pd1 <- cbind.data.frame(temp_model$evaluation_log[,c("iter", "test_error_mean")], 
+                          rep(etas[i], nrow(temp_model$evaluation_log)))
+  names(pd1)[3] <- "eta"
+  pd_res[[i]] = pd1
+  
+}
+
+plot_data <- rbind.data.frame(pd_res[[1]], pd_res[[2]], pd_res[[3]], 
+                              pd_res[[4]], pd_res[[5]], pd_res[[6]])
+plot_data$eta <- as.factor(plot_data$eta)
+
+best_model <- plot_data[which.min(plot_data$test_error_mean),]
+
+bst <- xgboost(data = dtrain, # Set training data
+            
+             eta = best_model$eta, # Set learning rate
+             nrounds = best_model$iter+20, # Set number of rounds
+             early_stopping_rounds = 15, # Set number of rounds to stop at if there is no improvement
+
+             verbose = 1, # 1 - Prints out fit
+             nthread = parallel_threads, # Set number of parallel threads
+             print_every_n = 20, # Prints out result every 20th iteration
+            
+             objective = "binary:logistic", # Set objective
+             eval_metric = "auc",
+             eval_metric = "error") # Set evaluation metric to use
+
+boost_preds <- predict(bst, dtest) # Create predictions for XGBoost model
+
+pred_dat <- cbind.data.frame(boost_preds , test_data$rush)
+
+names(pred_dat) <- c("predictions", "response")
+
+oc <- optimal.cutpoints(X = "predictions",
+               status = "response",
+               tag.healthy = 0,
+               data = pred_dat,
+               methods = "MaxEfficiency")
+
+# Convert predictions to classes, using optimal cut-off
+boost_pred_class <- rep(0, length(boost_preds))
+boost_pred_class[boost_preds >= 
+                   oc$MaxEfficiency$Global$optimal.cutoff$cutoff[1]] <- 1
+
+t <- table(boost_pred_class, test_data$rush) # Create table
+
+notre_dame_cm <- confusionMatrix(t, positive = "1") # Produce confusion matrix
+
+notre_dame_cm
+
+```
+
+
+## All-Team Model
+
+```{r}
+
+model_data <- xg_data
+
+train_data <- model_data[sample(nrow(model_data),nrow(model_data)*.6),]
+test_data <- setdiff(model_data,train_data)
+
+train_data <- train_data %>% 
+  select(-c(def_pos_team,game_play_number))
+test_data <- test_data %>% 
+  select(-c(def_pos_team,game_play_number))
+
+train_d_predictors <- train_data %>% 
+  select(-c(pos_team,rush))
+tst_d_predictors<- test_data %>% 
+  select(-c(pos_team,rush))
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_d_predictors), 
+                        label = as.numeric(train_data$rush))
+# Create test matrix
+dtest <- xgb.DMatrix(data = as.matrix(tst_d_predictors), 
+                     label = as.numeric(test_data$rush))
+
+etas <- c(.3,.2,.1,.05, .025, .001)
+
+model_res <- vector(mode = "list", length = length(etas))
+pd_res <- vector(mode = "list", length = length(etas))
+
+for (i in c(1:length(etas)))
+{
+  temp_model <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = etas[i], # Set learning rate
+              max.depth = 7, # Set max depth
+              min_child_weight = 10, # Set minimum number of samples in node to split
+              gamma = 0, # Set minimum loss reduction for split
+              subsample = 0.9 , # Set proportion of training data to use in tree
+              colsample_bytree = 0.9, # Set number of variables to use in each tree
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 0, # 1 - Prints out fit
+              nthread = parallel_threads, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+               
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to 
+  
+  model_res[[i]] = temp_model
+  
+  pd1 <- cbind.data.frame(temp_model$evaluation_log[,c("iter", "test_error_mean")], 
+                          rep(etas[i], nrow(temp_model$evaluation_log)))
+  names(pd1)[3] <- "eta"
+  pd_res[[i]] = pd1
+  
+}
+
+plot_data <- rbind.data.frame(pd_res[[1]], pd_res[[2]], pd_res[[3]], 
+                              pd_res[[4]], pd_res[[5]], pd_res[[6]])
+plot_data$eta <- as.factor(plot_data$eta)
+
+best_model <- plot_data[which.min(plot_data$test_error_mean),]
+
+bst <- xgboost(data = dtrain, # Set training data
+            
+             eta = best_model$eta, # Set learning rate
+             nrounds = best_model$iter+20, # Set number of rounds
+             early_stopping_rounds = 15, # Set number of rounds to stop at if there is no improvement
+
+             verbose = 1, # 1 - Prints out fit
+             nthread = parallel_threads, # Set number of parallel threads
+             print_every_n = 20, # Prints out result every 20th iteration
+            
+             objective = "binary:logistic", # Set objective
+             eval_metric = "auc",
+             eval_metric = "error") # Set evaluation metric to use
+
+boost_preds <- predict(bst, dtest) # Create predictions for XGBoost model
+
+pred_dat <- cbind.data.frame(boost_preds , test_data$rush)
+
+names(pred_dat) <- c("predictions", "response")
+
+oc <- optimal.cutpoints(X = "predictions",
+               status = "response",
+               tag.healthy = 0,
+               data = pred_dat,
+               methods = "MaxEfficiency")
+
+# Convert predictions to classes, using optimal cut-off
+boost_pred_class <- rep(0, length(boost_preds))
+boost_pred_class[boost_preds >= 
+                   oc$MaxEfficiency$Global$optimal.cutoff$cutoff[1]] <- 1
+
+t <- table(boost_pred_class, test_data$rush) # Create table
+
+all_teams_cm <- confusionMatrix(t, positive = "1") # Produce confusion matrix
+
+all_teams_cm
+
+```
+
+
+## Model by Classification Group
+
+This large loop builds an optimal XGBoost model for each subset of teams 
+classified by the K-Means clustering process completed earlier. For each group
+of teams, 6 different eta (learning rate) values are tried. From the results
+of the xgb.cv run, the optimal eta value and number of iterations are obtained
+and passed to the final model for that particular group. 
+
+Next, after the final model has been built for the group, the test data (a 40% 
+partition) is filtered by team for each team in the modeled group and 
+separate confusion matrices are generated. This way, accuracy metrics for each
+team are available, as well as accuracy metrics for each modeling group.
+
+ETA GGPlots, training / test data partitions, XGB matrices, and optimal models
+are stored in vectors for easy access later in the analysis process.
+
+
+```{r giant_loop}
+
+runs = length(team_groups)
+
+all_model_res <- list()
+all_models <- list()
+eta_plots <- list()
+dtrain_storage <- list()
+dtest_storage <- list()
+test_data_storage <- list()
+group_cms <- list()
+
+for(i in 1:runs){
+  
+  group_number = i
+  
+  
+  model_data <- xg_data %>% 
+    filter(pos_team %in% team_groups[[group_number]])
+  
+  set.seed(696969)
+  
+  train_data <- model_data[sample(nrow(model_data),nrow(model_data)*.6),]
+  test_data <- setdiff(model_data,train_data)
+  
+  train_data <- train_data %>% 
+    select(-c(def_pos_team,game_play_number))
+  test_data <- test_data %>% 
+    select(-c(def_pos_team,game_play_number))
+  
+  train_d_predictors <- train_data %>% 
+    select(-c(pos_team,rush))
+  tst_d_predictors<- test_data %>% 
+    select(-c(pos_team,rush))
+
+
+  dtrain <- xgb.DMatrix(data = as.matrix(train_d_predictors), 
+                        label = as.numeric(train_data$rush))
+  # Create test matrix
+  dtest <- xgb.DMatrix(data = as.matrix(tst_d_predictors), 
+                       label = as.numeric(test_data$rush))
+
+  etas <- c(.3,.2,.1,.05, .025, .001)
+  
+  model_res <- vector(mode = "list", length = length(etas))
+  pd_res <- vector(mode = "list", length = length(etas))
+  
+  for (i in c(1:length(etas)))
+  {
+    temp_model <- xgb.cv(data = dtrain, # Set training data
+                
+                nfold = 5, # Use 5 fold cross-validation
+                 
+                eta = etas[i], # Set learning rate
+                max.depth = 7, # Set max depth
+                min_child_weight = 10, # Set minimum number of samples in node to split
+                gamma = 0, # Set minimum loss reduction for split
+                subsample = 0.9 , # Set proportion of training data to use in tree
+                colsample_bytree = 0.9, # Set number of variables to use in each tree
+                 
+                nrounds = 1000, # Set number of rounds
+                early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                 
+                verbose = 0, # 1 - Prints out fit
+                nthread = parallel_threads, # Set number of parallel threads
+                print_every_n = 20, # Prints out result every 20th iteration
+                 
+                objective = "binary:logistic", # Set objective
+                eval_metric = "auc",
+                eval_metric = "error") # Set evaluation metric to 
+    
+    model_res[[i]] = temp_model
+    
+    pd1 <- cbind.data.frame(temp_model$evaluation_log[,c("iter", "test_error_mean")], 
+                            rep(etas[i], nrow(temp_model$evaluation_log)))
+    names(pd1)[3] <- "eta"
+    pd_res[[i]] = pd1
+    
+  }
+
+  plot_data <- rbind.data.frame(pd_res[[1]], pd_res[[2]], pd_res[[3]], 
+                                pd_res[[4]], pd_res[[5]],pd_res[[6]])
+  plot_data$eta <- as.factor(plot_data$eta)
+  
+  g_8 <- ggplot(plot_data, aes(x = iter, y = test_error_mean, color = eta))+
+  geom_smooth(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "Error Rate v Number of Trees",
+       y = "Error Rate", color = "Learning \n Rate")  # Set labels
+  
+  best_model <- plot_data[which.min(plot_data$test_error_mean),]
+
+  bst <- xgboost(data = dtrain, # Set training data
+              
+               eta = best_model$eta, # Set learning rate
+               nrounds = best_model$iter+20, # Set number of rounds
+               early_stopping_rounds = 15, # Set number of rounds to stop at if there is no improvement
+
+               verbose = 1, # 1 - Prints out fit
+               nthread = parallel_threads, # Set number of parallel threads
+               print_every_n = 20, # Prints out result every 20th iteration
+              
+               objective = "binary:logistic", # Set objective
+               eval_metric = "auc",
+               eval_metric = "error") # Set evaluation metric to use
+  
+  team_accuracy <- vector(mode = "list", 
+                          length = length(team_groups[[group_number]]))
+  team_sensitivity <- vector(mode = "list", 
+                             length = length(team_groups[[group_number]]))
+  team_specificity <- vector(mode = "list", 
+                             length = length(team_groups[[group_number]]))
+  team_group <- vector(mode = "list", length = 
+                         length(team_groups[[group_number]]))
+  
+  # calculate optimal cutoff for group
+  
+  test_data <- test_data %>% 
+      filter(pos_team %in% team_groups[[group_number]])
+  
+  test_d_predictors <- test_data %>% 
+    select(-c(pos_team,rush))
+    
+  dtest <- xgb.DMatrix(data = as.matrix(test_d_predictors), 
+                       label = as.numeric(test_data$rush))
+    
+  boost_preds <- predict(bst, dtest) # Create predictions for XGBoost model
+  
+  pred_dat <- cbind.data.frame(boost_preds , test_data$rush)
+  
+  names(pred_dat) <- c("predictions", "response")
+
+  oc <- optimal.cutpoints(X = "predictions",
+                 status = "response",
+                 tag.healthy = 0,
+                 data = pred_dat,
+                 methods = "MaxEfficiency")
+  
+  # Uses same OC for each team in group
+  
+  team_cms = list()
+  
+  for(j in 1:length(team_groups[[group_number]])){
+    team_test_data <- test_data %>% 
+      filter(pos_team == team_groups[[group_number]][j])
+  
+    team_test_d_predictors <- team_test_data %>% 
+      select(-c(pos_team,rush))
+    
+    team_dtest <- xgb.DMatrix(data = as.matrix(team_test_d_predictors), 
+                              label = as.numeric(team_test_data$rush))
+    
+    boost_preds <- predict(bst, team_dtest) # Create predictions for XGBoost model
+    
+    pred_dat <- cbind.data.frame(boost_preds , team_test_data$rush)
+    
+    names(pred_dat) <- c("predictions", "response")
+    
+    # Convert predictions to classes, using optimal cut-off
+    boost_pred_class <- rep(0, length(boost_preds))
+    boost_pred_class[boost_preds >= 
+                       oc$MaxEfficiency$Global$optimal.cutoff$cutoff[1]] <- 1
+    
+    t <- table(boost_pred_class, team_test_data$rush) # Create table
+
+    cm <- confusionMatrix(t, positive = "1") # Produce confusion matrix
+    team_cms[[j]] <- cm$table
+    
+    team_accuracy[j] <- round(cm$overall[1],2)
+    team_sensitivity[j] <- round(cm$byClass[1],2)
+    team_specificity[j] <- round(cm$byClass[2],2)
+    team_group[j] <- group_number
+    
+    print(paste("Modeled team ",j," in Group ", group_number))
+    
+  }
+  
+  group_cms[[group_number]] <- team_cms
+  
+  performance <- rbind.data.frame(team_groups[[group_number]] , team_accuracy, 
+                                  team_sensitivity, team_specificity, team_group)
+  performance <- t(performance)
+  colnames(performance) <- c("Team", "Accuracy","Sensitivity",
+                             "Specificity","Group")
+  rownames(performance) <- NULL
+  plot_dat <- merge(performance, cfb_logos, by.x = "Team", by.y = "school")
+  
+  all_model_res[[group_number]] = plot_dat
+  all_models[[group_number]] = bst
+  eta_plots[[group_number]] = g_8
+  test_data_storage[[group_number]] = test_data
+  dtrain_storage[[group_number]] = dtrain
+  dtest_storage[[group_number]] = dtest
+  
+  
+  print(paste("Finished Iteration ",group_number))
+}
+
+
+```
+
+With model result data stored in vectors, it is possible to combine all 
+accuracy metrics for all model groups into one dataframe for display.
+
+### Combining Confusion Matrices
+
+```{r}
+
+t1 <- group_cms[[1]][[1]][1,1]
+
+one_one <- 0
+one_two <- 0
+two_one <- 0
+two_two <- 0
+
+for(i in 1:length(group_cms)){
+  group_cm = group_cms[[i]]
+  for(i in 1:length(group_cm)){
+    team_cm = group_cm[[i]]
+    one_one = one_one + team_cm[1,1]
+    one_two = one_two + team_cm[1,2]
+    two_one = two_one + team_cm[2,1]
+    two_two = two_two + team_cm[2,2]
+  }
+}
+
+grouped_cm <- data.frame(c(one_one,two_one),c(one_two,two_two))
+names(grouped_cm) <- c("0","1")
+rownames(grouped_cm) <- c("0","1")
+
+grouped_accuracy <- (one_one + two_two) / (one_one + two_two + two_one + one_two)
+grouped_senstivity <- (two_two)/(one_two + two_two)
+grouped_specificity <- (one_one)/(one_one + two_one)
+
+accuracy_improvement <- grouped_accuracy - all_teams_cm$overall[1]
+sensitivity_improvement <- grouped_senstivity - all_teams_cm$byClass[1]
+specificity_improvement <- grouped_specificity - all_teams_cm$byClass[2]
+
+accuracy_improvement
+sensitivity_improvement
+specificity_improvement
+
+grouped_cm
+
+```
+While grouping the teams by their K-Means clusters slightly decreases the overall
+accuracy of the model, it increases the specificity of the model to be more balanced
+with sensitivity.
+
+This is more beneficial for the use cases of the eventual model, as correctly 
+predicting a pass play (as they are more infrequent) provides a better betting 
+edge (typically plus-money) as well as helps defenses force more turnovers / 
+reduce big plays.
+
+## Accuracy Plotting
+
+```{r}
+
+big_plot_data = do.call(rbind, all_model_res)
+
+```
+
+### All Teams Sensitivity / Specificity
+
+```{r plot}
+
+# Create plot
+g_1 <- ggplot(big_plot_data, # Set dataset 
+              aes(x = as.numeric(Sensitivity), y = as.numeric(Specificity))) + # Set aesthetics
+  geom_point(alpha = 0.3) + # Set geom point
+  geom_image(image = big_plot_data$logos, asp = 16/9) + # Add logos
+  labs(y = "Pass Prediction Accuracy", # Add labels
+       x = "Rush Prediction Accuracy",
+       title = "Prediction Power",
+       subtitle = "CFB - 2020 Season") +
+  dark_theme_bw() + # Set theme
+  theme( # Modify plot elements
+    axis.text = element_text(size = 8), # Change Axis text size
+    axis.title.x = element_text(size = 10), # Change x axis title size
+    axis.title.y = element_text(size = 10), # Change y axis title size 
+    plot.title = element_text(size = 14), # Change plot title size
+    plot.subtitle = element_text(size = 12), # Change plot subtitle size
+    plot.caption = element_text(size = 8), # Change plot caption size
+    panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank())
+
+g_1 +
+  xlim(0,1) + 
+  ylim(0,1)
+
+```
+
+```{r zoomed_plot}
+
+g_1 +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10))
+
+```
+
+### Top 20 Teams Accuracy
+
+```{r}
+
+plot_data <- head(big_plot_data %>% 
+                    arrange(desc(Accuracy)), 20
+                  )
+# Barplot
+g_2 <- ggplot(plot_data, aes(x=as.factor(Team),y=as.numeric(Accuracy),fill=as.factor(Group))) + 
+  geom_bar(stat = "identity") +
+  dark_theme_bw() + # Set theme
+  theme( # Modify plot elements
+    axis.text = element_text(size = 8), # Change Axis text size
+    axis.title.x = element_text(size = 10), # Change x axis title size
+    axis.title.y = element_text(size = 10), # Change y axis title size 
+    plot.title = element_text(size = 14), # Change plot title size
+    plot.subtitle = element_text(size = 12), # Change plot subtitle size
+    plot.caption = element_text(size = 8), # Change plot caption size
+    panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  coord_flip() +
+  aes(fct_reorder(Team,Accuracy)) +
+  ylim(0,1) +
+  labs(y = "Accuracy", # Add labels
+       x = "Team",
+       title = "Prediction Power",
+       subtitle = "CFB - 2020 Season") +
+  scale_fill_discrete(name = "Model Group")
+
+g_2 + transition_states(Group, wrap = FALSE) +
+  shadow_mark()
+
+```
+
+
+### Bottom 20 Teams Accuracy
+
+```{r}
+
+plot_data <- tail(big_plot_data %>% 
+                    arrange(desc(Accuracy)), 20
+                  )
+
+# Barplot
+g_3 <- ggplot(plot_data, aes(x=as.factor(Team),y=as.numeric(Accuracy),fill=as.factor(Group))) + 
+  geom_bar(stat = "identity") +
+  dark_theme_bw() + # Set theme
+  theme( # Modify plot elements
+    axis.text = element_text(size = 8), # Change Axis text size
+    axis.title.x = element_text(size = 10), # Change x axis title size
+    axis.title.y = element_text(size = 10), # Change y axis title size 
+    plot.title = element_text(size = 14), # Change plot title size
+    plot.subtitle = element_text(size = 12), # Change plot subtitle size
+    plot.caption = element_text(size = 8), # Change plot caption size
+    panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  coord_flip() +
+  aes(fct_reorder(Team,Accuracy)) +
+  ylim(0,1) +
+  labs(y = "Accuracy", # Add labels
+       x = "Team",
+       title = "Prediction Power",
+       subtitle = "CFB - 2020 Season") +
+  scale_fill_discrete(name = "Model Group")
+
+g_3+ transition_states(Group, wrap = FALSE) +
+  shadow_mark()
+  
+
+```
+
+### All Teams Accuracy
+
+```{r}
+
+plot_data <- big_plot_data %>% 
+                arrange(desc(Accuracy))
+# Barplot
+g_3 <- ggplot(plot_data, aes(x=as.factor(Team),y=as.numeric(Accuracy),fill=as.factor(Group))) + 
+  geom_bar(stat = "identity") +
+  dark_theme_bw() + # Set theme
+  theme( # Modify plot elements
+    axis.text = element_text(size = 8), # Change Axis text size
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(), # Change x axis title size
+    axis.title.x = element_text(size = 10), # Change y axis title size 
+    plot.title = element_text(size = 14), # Change plot title size
+    plot.subtitle = element_text(size = 12), # Change plot subtitle size
+    plot.caption = element_text(size = 8), # Change plot caption size
+    panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +
+  coord_flip() +
+  aes(fct_reorder(Team,Accuracy)) +
+  ylim(0,1) +
+  labs(y = "Accuracy", # Add labels
+       x = "Team",
+       title = "Prediction Power",
+       subtitle = "CFB - 2020 Season") +
+  scale_fill_discrete(name = "Model Group")
+
+g_3 + transition_states(Group, wrap = FALSE) +
+  shadow_mark()
+
+```
+
+### ETA Plots by Model Group
+
+```{r}
+
+for(i in 1:length(team_groups)){
+  print(paste("Model ",i," ETA Plot"))
+  print(eta_plots[[i]])
+}
+
+```
+## Variable Importance 
+
+### Importance by Model
+
+```{r var_importance}
+
+mats = list()
+
+for(i in 1:length(team_groups)){
+  
+  bst_2 = all_models[[i]]
+    
+  # Extract importance
+  imp_mat <- xgb.importance(model = bst_2)
+  mats[[i]] <- imp_mat
+  # Plot importance (top 10 variables)
+  print(paste("Model ",i," Importance Plot"))
+  xgb.plot.importance(imp_mat, top_n = 10)
+}
+
+```
+
+### Overall Importance
+
+```{r}
+
+library(data.table)
+
+# Big mat
+big_imp_dat = do.call(rbind, mats) %>%  
+  group_by(Feature) %>% 
+  summarize(Importance = mean(Importance),
+            Gain = mean(Gain),
+            Cover = mean(Cover),
+            Frequency = mean(Frequency)) %>% 
+  setDF()
+
+xgb.plot.importance(as.data.table(big_imp_dat), top_n = 10)
+
+```
+
+## Explainers
+
+The following chunk creates a vector containing the explainer for each model.
+Since there are 6 groups, 6 explainers have to be generated which takes ~20 
+minutes.
+
+```{r build_explainers}
+
+# explainers = list()
+# 
+# for(i in 1:length(team_groups)){
+#   
+#   bst_2 = all_models[[i]]
+#     
+#   explainer = buildExplainer(bst_2, dtrain_storage[[i]], type="binary", base_score = 0.5, trees_idx = NULL) # Create explainer
+# 
+#   explainers[[i]] = explainer
+#   
+# }
+
+# source("modified_waterfall_functions.r")
+# 
+# for(i in length(team_groups)){
+#   
+#   bst_2 = all_models[[i]]
+#   explainer = explainers[[i]]
+#   dtest = dtest_storage[[i]]
+#   test_data = test_data_storage[[i]]
+#   
+#   print(showWaterfall_2(bst_2,explainer,dtest,as.matrix(test_data[, 2:ncol(test_data)]),1,type = "binary", threshold = 0.07))
+#   test_data$rush
+#   
+# }
+
+```
+
+The following chunk generates a single explainer from a chosen model. In this
+case, we choose the model group containing Notre Dame
+
+### Waterfall
+
+```{r results='hide'}
+
+i = 1
+
+for(j in 1:length(team_groups)){
+  if("Notre Dame" %in% team_groups[[j]]){
+    i = j
+  }
+}
+
+bst_2 = all_models[[i]]
+
+explainer = buildExplainer(bst_2, dtrain_storage[[i]], type="binary", base_score = 0.5, trees_idx = NULL) # Create explainer
+
+```
+
+
+```{r results='hide'}
+
+source("modified_waterfall_functions.r")
+
+bst_2 = all_models[[i]]
+dtest = dtest_storage[[i]]
+test_data = test_data_storage[[i]]
+
+a = sample(which(test_data$pos_team=="Notre Dame"),1)
+
+print(showWaterfall_2(bst_2,explainer,dtest,as.matrix(test_data[, 2:ncol(test_data)]),a,type = "binary", threshold = 0.07))
+print("Actual Data")
+print(test_data[a,])
+
+```
+
+# Additional Plots + Animations
+
+```{r load_plot_data}
+
+# Intermediate Plot Dataset Written for ease of access
+big_plots <- read.csv("big_plots.csv")
+
+```
+
+```{r}
+
+plot_dat <- big_plots %>% 
+  select(Team, Accuracy, Sensitivity, Specificity, Group, color, alt_color, logos)
+
+```
+
+## Grouped Model Accuracy Plots
+
+```{r animated_bar,warning=FALSE}
+
+p <- ggplot(plot_dat %>% group_by(Group) %>% 
+  summarize(Accuracy=mean(Accuracy)), aes(Group, Accuracy, fill = Accuracy)) +
+  geom_col() +
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.grid.major.y = element_line(color = "white"),
+    panel.ontop = TRUE
+  ) +
+  dark_theme_bw()
+
+p4 <- p + transition_states(Group ,transition_length = 1, state_length = 2 ,wrap = FALSE) +
+  shadow_mark()
+
+animate(p4, fps=10,duration = 24)
+
+```
+
+```{r data_manip ,warning=FALSE}
+
+pd2 <- plot_dat %>% 
+  mutate(stage=2) %>% 
+  union_all(
+    plot_dat %>% group_by(Group) %>% 
+      mutate(Accuracy=mean(Accuracy),
+                Sensitivity=mean(Sensitivity),
+                Specificity=mean(Specificity)) %>% 
+      mutate(stage = 1) %>% 
+      mutate(Team = paste("Group ",Group)) %>% 
+    mutate(logos=NA)
+  ) %>% 
+  mutate(stage = ifelse(stage==1,2*Group-1,2*Group))
+
+
+```
+
+```{r warning=FALSE}
+
+p3 <- ggplot(pd2, # Set dataset 
+              aes(x = Sensitivity, y = Specificity)) + # Set aesthetics
+  geom_point(alpha = 0.3, aes(color=as.factor(Group)), size = 2) + # Set geom point
+  geom_image(image = pd2$logos, asp = 16/9) + # Add logos
+  
+  labs(y = "Pass Prediction Accuracy", # Add labels
+       x = "Rush Prediction Accuracy",
+       title = "Sensitivity and Specificity by Model Group",
+       subtitle = "CFB - 2020 Season") +
+  dark_theme_bw() + # Set theme
+  theme( # Modify plot elements
+    axis.text = element_text(size = 10), # Change Axis text size
+    axis.title.x = element_text(size = 12), # Change x axis title size
+    axis.title.y = element_text(size = 12), # Change y axis title size 
+    plot.title = element_text(size = 16), # Change plot title size
+    plot.subtitle = element_text(size = 14), # Change plot subtitle size
+    plot.caption = element_text(size = 10), # Change plot caption size
+    panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank(), # Remove grid
+    legend.position = "none"
+  ) +
+  xlim(.3,1) +
+  ylim(.3,1) +
+  # scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  # scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) + 
+  transition_states(stage,transition_length = 1, state_length = 2 ) +
+  ease_aes('cubic-in-out')
+
+
+animate(p3,duration=24,fps=10)
+
+```
